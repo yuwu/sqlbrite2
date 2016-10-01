@@ -18,6 +18,7 @@ package com.squareup.sqlbrite;
 import android.annotation.TargetApi;
 import android.content.ContentValues;
 import android.database.Cursor;
+import android.database.MatrixCursor;
 import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteOpenHelper;
 import android.database.sqlite.SQLiteTransactionListener;
@@ -25,15 +26,20 @@ import android.support.annotation.CheckResult;
 import android.support.annotation.IntDef;
 import android.support.annotation.NonNull;
 import android.support.annotation.Nullable;
-import android.support.annotation.RequiresApi;
+import android.text.TextUtils;
+
 import com.squareup.sqlbrite.SqlBrite.Query;
+
 import java.io.Closeable;
 import java.lang.annotation.Retention;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+
 import rx.Observable;
 import rx.Scheduler;
 import rx.Subscriber;
@@ -63,7 +69,9 @@ public final class BriteDatabase implements Closeable {
   // Package-private to avoid synthetic accessor method for 'transaction' instance.
   final ThreadLocal<SqliteTransaction> transactions = new ThreadLocal<>();
   /** Publishes sets of tables which have changed. */
-  private final PublishSubject<Set<String>> triggers = PublishSubject.create();
+  private final PublishSubject<Set<CommandWraper>> triggers = PublishSubject.create();
+
+  private final TableMapper tableMapper = new TableMapper();
 
   private final Transaction transaction = new Transaction() {
     @Override public void markSuccessful() {
@@ -158,7 +166,7 @@ public final class BriteDatabase implements Closeable {
     return db;
   }
 
-  void sendTableTrigger(Set<String> tables) {
+  void sendTableTrigger(Set<CommandWraper> tables) {
     SqliteTransaction transaction = transactions.get();
     if (transaction != null) {
       transaction.addAll(tables);
@@ -253,7 +261,6 @@ public final class BriteDatabase implements Closeable {
    * @see SQLiteDatabase#beginTransactionNonExclusive()
    */
   @TargetApi(HONEYCOMB)
-  @RequiresApi(HONEYCOMB)
   @CheckResult @NonNull
   public Transaction newNonExclusiveTransaction() {
     SqliteTransaction transaction = new SqliteTransaction(transactions.get());
@@ -302,10 +309,16 @@ public final class BriteDatabase implements Closeable {
    */
   @CheckResult @NonNull
   public QueryObservable createQuery(@NonNull final String table, @NonNull String sql,
-      @NonNull String... args) {
-    Func1<Set<String>, Boolean> tableFilter = new Func1<Set<String>, Boolean>() {
-      @Override public Boolean call(Set<String> triggers) {
-        return triggers.contains(table);
+                                     @NonNull String... args) {
+    Func1<Set<CommandWraper>, Boolean> tableFilter = new Func1<Set<CommandWraper>, Boolean>() {
+      @Override public Boolean call(Set<CommandWraper> triggers) {
+
+        for(CommandWraper next : triggers){
+          if(next.table.equalsIgnoreCase(table)){
+            return true;
+          }
+        }
+        return false;
       }
 
       @Override public String toString() {
@@ -323,12 +336,14 @@ public final class BriteDatabase implements Closeable {
    */
   @CheckResult @NonNull
   public QueryObservable createQuery(@NonNull final Iterable<String> tables, @NonNull String sql,
-      @NonNull String... args) {
-    Func1<Set<String>, Boolean> tableFilter = new Func1<Set<String>, Boolean>() {
-      @Override public Boolean call(Set<String> triggers) {
+                                     @NonNull String... args) {
+    Func1<Set<CommandWraper>, Boolean> tableFilter = new Func1<Set<CommandWraper>, Boolean>() {
+      @Override public Boolean call(Set<CommandWraper> triggers) {
         for (String table : tables) {
-          if (triggers.contains(table)) {
-            return true;
+          for(CommandWraper next : triggers){
+            if(next.table.equalsIgnoreCase(table)){
+              return true;
+            }
           }
         }
         return false;
@@ -342,22 +357,188 @@ public final class BriteDatabase implements Closeable {
   }
 
   @CheckResult @NonNull
-  private QueryObservable createQuery(Func1<Set<String>, Boolean> tableFilter, String sql,
-      String... args) {
+  private QueryObservable createQuery(Func1<Set<CommandWraper>, Boolean> tableFilter, String sql,
+                                      String... args) {
     if (transactions.get() != null) {
       throw new IllegalStateException("Cannot create observable query in transaction. "
-          + "Use query() for a query inside a transaction.");
+              + "Use query() for a query inside a transaction.");
     }
 
     DatabaseQuery query = new DatabaseQuery(tableFilter, sql, args);
     final Observable<Query> queryObservable = triggers //
-        .filter(tableFilter) // Only trigger on tables we care about.
-        .map(query) // DatabaseQuery maps to itself to save an allocation.
-        .onBackpressureLatest() // Guard against uncontrollable frequency of upstream emissions.
-        .startWith(query) //
-        .observeOn(scheduler) //
-        .onBackpressureLatest() // Guard against uncontrollable frequency of scheduler executions.
-        .doOnSubscribe(ensureNotInTransaction);
+            .filter(tableFilter) // Only trigger on tables we care about.
+            .map(query) // DatabaseQuery maps to itself to save an allocation.
+            .onBackpressureLatest() // Guard against uncontrollable frequency of upstream emissions.
+            .startWith(query) //
+            .observeOn(scheduler) //
+            .onBackpressureLatest() // Guard against uncontrollable frequency of scheduler executions.
+            .doOnSubscribe(ensureNotInTransaction);
+    // TODO switch to .extend when non-@Experimental
+    return new QueryObservable(new Observable.OnSubscribe<Query>() {
+      @Override public void call(Subscriber<? super Query> subscriber) {
+        queryObservable.unsafeSubscribe(subscriber);
+      }
+    });
+  }
+
+  public BriteDatabase registMapper(final String table, String primaryKey){
+    tableMapper.put(table, primaryKey);
+    return this;
+  }
+
+  public BriteDatabase unregistMapper(final String table, String primaryKey){
+    tableMapper.put(table, primaryKey);
+    return this;
+  }
+
+  public QueryObservable listener(@NonNull final String table) {
+    if(!tableMapper.containsKey(table)){
+      registMapper(table, "rowid");
+      if(logging){
+        log("Can't find %s primary key. Use default rowid", table);
+      }
+    }
+    Func1<Set<CommandWraper>, Boolean> tableFilter = new Func1<Set<CommandWraper>, Boolean>() {
+      @Override public Boolean call(Set<CommandWraper> triggers) {
+
+        for(CommandWraper next : triggers){
+          if(next.table.equalsIgnoreCase(table)){
+            return true;
+          }
+        }
+        return false;
+      }
+
+      @Override public String toString() {
+        return table;
+      }
+    };
+    return listener(tableFilter);
+  }
+
+  public QueryObservable listener(@NonNull final String table, final Command cmd) {
+    if(!tableMapper.containsKey(table)){
+      registMapper(table, "rowid");
+      if(logging){
+        log("Can't find %s primary key. Use default rowid", table);
+      }
+    }
+    Func1<Set<CommandWraper>, Boolean> tableFilter = new Func1<Set<CommandWraper>, Boolean>() {
+      @Override public Boolean call(Set<CommandWraper> triggers) {
+
+        for(CommandWraper next : triggers){
+          if(next.table.equalsIgnoreCase(table) && next.cmd == cmd){
+            return true;
+          }
+        }
+        return false;
+      }
+
+      @Override public String toString() {
+        return table;
+      }
+    };
+    return listener(tableFilter);
+  }
+
+  public QueryObservable listener(@NonNull final String table, final Command cmd, final int columnValue) {
+    return listener(table, cmd, "rowid", columnValue);
+  }
+
+  public QueryObservable listener(@NonNull final String table, final Command cmd, final String columnName, final Object columnValue) {
+    if(TextUtils.isEmpty(columnName) || columnValue == null){
+      throw new RuntimeException("ColumnName cannot be empty.");
+    }
+
+    if(!tableMapper.containsKey(table)){
+      registMapper(table, columnName);
+    }
+
+    Func1<Set<CommandWraper>, Boolean> tableFilter = new Func1<Set<CommandWraper>, Boolean>() {
+      @Override public Boolean call(Set<CommandWraper> triggers) {
+
+        for(CommandWraper next : triggers){
+          if(next.table.equalsIgnoreCase(table) && next.cmd == cmd){
+            Cursor cursor = next.result;
+            if(cursor == null || cursor.getCount() == 0){
+              return false;
+            }
+            final int columnIndex = cursor.getColumnIndex(columnName);
+            for(cursor.moveToFirst(); !cursor.isAfterLast(); cursor.moveToNext()){
+              if(cursor.getString(columnIndex).equals(String.valueOf(columnValue))){
+                return true;
+              }
+            }
+            return false;
+          }
+        }
+        return false;
+      }
+
+      @Override public String toString() {
+        return table;
+      }
+    };
+    return listener(tableFilter);
+  }
+
+  public QueryObservable listener(@NonNull final String table, final int columnValue) {
+    return listener(table, "rowid", columnValue);
+  }
+
+  public QueryObservable listener(@NonNull final String table, final String columnName,final Object columnValue) {
+    if(TextUtils.isEmpty(columnName) || columnValue == null){
+      throw new RuntimeException("ColumnName cannot be empty.");
+    }
+
+    if(!tableMapper.containsKey(table)){
+      registMapper(table, columnName);
+    }
+
+    Func1<Set<CommandWraper>, Boolean> tableFilter = new Func1<Set<CommandWraper>, Boolean>() {
+      @Override public Boolean call(Set<CommandWraper> triggers) {
+
+        for(CommandWraper next : triggers){
+          if(next.table.equalsIgnoreCase(table)){
+            Cursor cursor = next.result;
+            if(cursor == null || cursor.getCount() == 0){
+              return false;
+            }
+            final int columnIndex = cursor.getColumnIndex(columnName);
+            for(cursor.moveToFirst(); !cursor.isAfterLast(); cursor.moveToNext()){
+              if(cursor.getString(columnIndex).equals(String.valueOf(columnValue))){
+                return true;
+              }
+            }
+            return false;
+          }
+        }
+        return false;
+      }
+
+      @Override public String toString() {
+        return table;
+      }
+    };
+    return listener(tableFilter);
+  }
+
+  @CheckResult @NonNull
+  private QueryObservable listener(Func1<Set<CommandWraper>, Boolean> tableFilter) {
+    if (transactions.get() != null) {
+      throw new IllegalStateException("Cannot create observable query in transaction. "
+              + "Use query() for a query inside a transaction.");
+    }
+
+    ActionWraper query = new ActionWraper(tableFilter);
+    final Observable<Query> queryObservable = triggers //
+            .filter(tableFilter) // Only trigger on tables we care about.
+            .map(query) // DatabaseQuery maps to itself to save an allocation.
+            .onBackpressureLatest() // Guard against uncontrollable frequency of upstream emissions.
+            //.startWith(query) //
+            .observeOn(scheduler) //
+            .onBackpressureLatest() // Guard against uncontrollable frequency of scheduler executions.
+            .doOnSubscribe(ensureNotInTransaction);
     // TODO switch to .extend when non-@Experimental
     return new QueryObservable(new Observable.OnSubscribe<Query>() {
       @Override public void call(Subscriber<? super Query> subscriber) {
@@ -401,20 +582,30 @@ public final class BriteDatabase implements Closeable {
    */
   // TODO @WorkerThread
   public long insert(@NonNull String table, @NonNull ContentValues values,
-      @ConflictAlgorithm int conflictAlgorithm) {
+                     @ConflictAlgorithm int conflictAlgorithm) {
     SQLiteDatabase db = getWriteableDatabase();
 
     if (logging) {
       log("INSERT\n  table: %s\n  values: %s\n  conflictAlgorithm: %s", table, values,
-          conflictString(conflictAlgorithm));
+              conflictString(conflictAlgorithm));
     }
+
     long rowId = db.insertWithOnConflict(table, null, values, conflictAlgorithm);
 
-    if (logging) log("INSERT id: %s", rowId);
+    Cursor result = null;
+    if(tableMapper.containsKey(table)){
+      result = queryWraper(table, "rowid=?", String.valueOf(rowId));
+    }
 
-    if (rowId != -1) {
+    if (logging) log("INSERT rowid: %s", rowId);
+
+    if (rowId != -1 && result != null) {
       // Only send a table trigger if the insert was successful.
-      sendTableTrigger(Collections.singleton(table));
+      final CommandWraper wraper = CommandWraper.insert(table);
+      wraper.result = result;
+      wraper.sql = "SELECT rowid, * FROM " + table + " WHERE rowid =?";
+      wraper.whereArgs = new String[]{String.valueOf(rowId)};
+      sendTableTrigger(Collections.singleton(wraper));
     }
     return rowId;
   }
@@ -427,20 +618,29 @@ public final class BriteDatabase implements Closeable {
    */
   // TODO @WorkerThread
   public int delete(@NonNull String table, @Nullable String whereClause,
-      @Nullable String... whereArgs) {
+                    @Nullable String... whereArgs) {
     SQLiteDatabase db = getWriteableDatabase();
 
     if (logging) {
       log("DELETE\n  table: %s\n  whereClause: %s\n  whereArgs: %s", table, whereClause,
-          Arrays.toString(whereArgs));
+              Arrays.toString(whereArgs));
     }
+
+    MatrixCursor matrixCursor = null;
+    if(tableMapper.containsKey(table)){
+      matrixCursor = queryWraper(table, whereClause, whereArgs);
+      if(matrixCursor == null) return -1;
+    }
+
     int rows = db.delete(table, whereClause, whereArgs);
 
     if (logging) log("DELETE affected %s %s", rows, rows != 1 ? "rows" : "row");
 
-    if (rows > 0) {
+    if (rows > 0 && matrixCursor != null) {
       // Only send a table trigger if rows were affected.
-      sendTableTrigger(Collections.singleton(table));
+      final CommandWraper wraper = CommandWraper.delete(table, whereClause, whereArgs);
+      wraper.result = matrixCursor;
+      sendTableTrigger(Collections.singleton(wraper));
     }
     return rows;
   }
@@ -453,7 +653,7 @@ public final class BriteDatabase implements Closeable {
    */
   // TODO @WorkerThread
   public int update(@NonNull String table, @NonNull ContentValues values,
-      @Nullable String whereClause, @Nullable String... whereArgs) {
+                    @Nullable String whereClause, @Nullable String... whereArgs) {
     return update(table, values, CONFLICT_NONE, whereClause, whereArgs);
   }
 
@@ -465,24 +665,81 @@ public final class BriteDatabase implements Closeable {
    */
   // TODO @WorkerThread
   public int update(@NonNull String table, @NonNull ContentValues values,
-      @ConflictAlgorithm int conflictAlgorithm, @Nullable String whereClause,
-      @Nullable String... whereArgs) {
+                    @ConflictAlgorithm int conflictAlgorithm, @Nullable String whereClause,
+                    @Nullable String... whereArgs) {
     SQLiteDatabase db = getWriteableDatabase();
 
     if (logging) {
       log("UPDATE\n  table: %s\n  values: %s\n  whereClause: %s\n  whereArgs: %s\n  conflictAlgorithm: %s",
-          table, values, whereClause, Arrays.toString(whereArgs),
-          conflictString(conflictAlgorithm));
+              table, values, whereClause, Arrays.toString(whereArgs),
+              conflictString(conflictAlgorithm));
     }
+
+    MatrixCursor matrixCursor = null;
+    if(tableMapper.containsKey(table)){
+      matrixCursor = queryWraper(table, whereClause, whereArgs);
+      if(matrixCursor == null) return -1;
+    }
+
     int rows = db.updateWithOnConflict(table, values, whereClause, whereArgs, conflictAlgorithm);
 
     if (logging) log("UPDATE affected %s %s", rows, rows != 1 ? "rows" : "row");
 
     if (rows > 0) {
       // Only send a table trigger if rows were affected.
-      sendTableTrigger(Collections.singleton(table));
+      final CommandWraper wraper = CommandWraper.update(table, whereClause, whereArgs);
+      wraper.result = matrixCursor;
+      sendTableTrigger(Collections.singleton(wraper));
     }
     return rows;
+  }
+
+  private MatrixCursor queryWraper(String table, String whereClause, String... whereArgs){
+    MatrixCursor matrixCursor = null;
+
+    final String sql = new StringBuilder()
+            .append("SELECT ")
+            .append("rowid as rowid, *")
+            .append(" FROM ")
+            .append(table)
+            .append(" WHERE ")
+            .append(whereClause)
+            .toString();
+
+    Cursor cursor = null;
+    try{
+
+      long startNanos = nanoTime();
+      cursor = getReadableDatabase().rawQuery(sql, whereArgs);
+
+      if (logging) {
+        long tookMillis = NANOSECONDS.toMillis(nanoTime() - startNanos);
+        log("QUERY (%sms)\n  sql: %s\n  args: %s", tookMillis, indentSql(sql), Arrays.toString(whereArgs));
+      }
+
+      if(cursor == null || cursor.getCount() <= 0) return null;
+
+      final int columnCount = cursor.getColumnNames().length;
+      matrixCursor = new MatrixCursor(cursor.getColumnNames(), cursor.getCount());
+      for(cursor.moveToFirst(); !cursor.isAfterLast(); cursor.moveToNext()){
+        Object[] values = new Object[columnCount];
+        for(int j=0; j<columnCount; j++){
+          values[j] = cursor.getString(j);
+        }
+        matrixCursor.addRow(values);
+      }
+
+      if (logging) {
+        int rows = matrixCursor.getCount();
+        log("QUERYWRAPER affected %s %s", rows, rows != 1 ? "rows" : "row");
+      }
+    }finally {
+
+      if(cursor != null){
+        cursor.close();
+      }
+    }
+    return matrixCursor;
   }
 
   /**
@@ -529,7 +786,7 @@ public final class BriteDatabase implements Closeable {
   public void executeAndTrigger(String table, String sql) {
     execute(sql);
 
-    sendTableTrigger(Collections.singleton(table));
+    sendTableTrigger(Collections.singleton(CommandWraper.unknown(table)));
   }
 
   /**
@@ -544,7 +801,7 @@ public final class BriteDatabase implements Closeable {
   public void executeAndTrigger(String table, String sql, Object... args) {
     execute(sql, args);
 
-    sendTableTrigger(Collections.singleton(table));
+    sendTableTrigger(Collections.singleton(CommandWraper.unknown(table)));
   }
 
   /** An in-progress database transaction. */
@@ -608,19 +865,19 @@ public final class BriteDatabase implements Closeable {
   }
 
   @IntDef({
-      CONFLICT_ABORT,
-      CONFLICT_FAIL,
-      CONFLICT_IGNORE,
-      CONFLICT_NONE,
-      CONFLICT_REPLACE,
-      CONFLICT_ROLLBACK
+          CONFLICT_ABORT,
+          CONFLICT_FAIL,
+          CONFLICT_IGNORE,
+          CONFLICT_NONE,
+          CONFLICT_REPLACE,
+          CONFLICT_ROLLBACK
   })
   @Retention(SOURCE)
   public @interface ConflictAlgorithm {
   }
 
   private static String indentSql(String sql) {
-    return sql.replace("\n", "\n       ");
+    return sql == null ? "" : sql.replace("\n", "\n       ");
   }
 
   void log(String message, Object... args) {
@@ -647,8 +904,8 @@ public final class BriteDatabase implements Closeable {
     }
   }
 
-  static final class SqliteTransaction extends LinkedHashSet<String>
-      implements SQLiteTransactionListener {
+  static final class SqliteTransaction extends LinkedHashSet<CommandWraper>
+          implements SQLiteTransactionListener {
     final SqliteTransaction parent;
     boolean commit;
 
@@ -672,12 +929,12 @@ public final class BriteDatabase implements Closeable {
     }
   }
 
-  final class DatabaseQuery extends Query implements Func1<Set<String>, Query> {
-    private final Func1<Set<String>, Boolean> tableFilter;
+  final class DatabaseQuery extends Query implements Func1<Set<CommandWraper>, Query> {
+    private final Func1<Set<CommandWraper>, Boolean> tableFilter;
     private final String sql;
     private final String[] args;
 
-    DatabaseQuery(Func1<Set<String>, Boolean> tableFilter, String sql, String... args) {
+    DatabaseQuery(Func1<Set<CommandWraper>, Boolean> tableFilter, String sql, String... args) {
       this.tableFilter = tableFilter;
       this.sql = sql;
       this.args = args;
@@ -694,7 +951,7 @@ public final class BriteDatabase implements Closeable {
       if (logging) {
         long tookMillis = NANOSECONDS.toMillis(nanoTime() - startNanos);
         log("QUERY (%sms)\n  tables: %s\n  sql: %s\n  args: %s", tookMillis, tableFilter,
-            indentSql(sql), Arrays.toString(args));
+                indentSql(sql), Arrays.toString(args));
       }
 
       return cursor;
@@ -704,8 +961,190 @@ public final class BriteDatabase implements Closeable {
       return sql;
     }
 
-    @Override public Query call(Set<String> ignored) {
+    @Override public Query call(Set<CommandWraper> ignored) {
       return this;
+    }
+  }
+
+  public class ActionWraper extends Query implements Func1<Set<CommandWraper>, Query> {
+    private final Func1<Set<CommandWraper>, Boolean> tableFilter;
+    private CommandWraper mNextWraper;
+
+    ActionWraper(Func1<Set<CommandWraper>, Boolean> tableFilter) {
+      this.tableFilter = tableFilter;
+    }
+
+    public CommandWraper cmd(){
+      return mNextWraper;
+    }
+
+    @Override public Cursor run() {
+      if (transactions.get() != null) {
+        throw new IllegalStateException("Cannot execute observable query in a transaction.");
+      }
+
+      final long startNanos = nanoTime();
+      String where = mNextWraper.whereClause;
+      String[] args = mNextWraper.whereArgs;
+      String sql = mNextWraper.sql;
+      String table = mNextWraper.table;
+      Cursor cursor = mNextWraper.result;
+
+      if(cursor == null) return null;
+
+      switch (mNextWraper.cmd){
+        case DELETE:
+          break;
+        case INSERT:
+          break;
+        case UPDATE:
+
+          MatrixCursor result = null;
+          try {
+            final int length = cursor.getCount();
+            int i = 0;
+            StringBuilder sb = new StringBuilder();
+            sb.append("rowid in (");
+            for(cursor.moveToFirst(); !cursor.isAfterLast(); cursor.moveToNext()){
+              int rowid = cursor.getInt(0);
+              sb.append(rowid);
+              if(i != length-1){
+                sb.append(",");
+              }
+              i++;
+            }
+            sb.append(")");
+            result = queryWraper(table, sb.toString());
+
+            if (logging) {
+              sql = "SELECT * FROM WHERE " + sb;
+            }
+          }finally {
+            if(cursor != null){
+              cursor.close();
+            }
+            cursor = mNextWraper.result = result;
+          }
+          break;
+        case UNKNOWN:
+        default:
+          break;
+      }
+
+      if (logging) {
+        long tookMillis = NANOSECONDS.toMillis(nanoTime() - startNanos);
+        log("%s.QUERY (%sms)\n  tables: %s\n  sql: %s\n  args: %s", mNextWraper.cmd.name(), tookMillis, tableFilter,
+                indentSql(sql), Arrays.toString(args));
+      }
+
+      return cursor;
+    }
+
+    @Override public String toString() {
+      return mNextWraper.toString();
+    }
+
+    @Override public Query call(Set<CommandWraper> wraper) {
+      this.mNextWraper = wraper.iterator().next();
+      return this;
+    }
+  }
+
+  public static class CommandWraper {
+    public final String table;
+
+    public String sql;
+
+    public Command cmd;
+
+    public String whereClause;
+
+    public String[] whereArgs;
+
+    Cursor result;
+
+    public CommandWraper(Command cmd, String table, String whereClause, String ...whereArgs) {
+      this(cmd, table, null, whereClause, whereArgs);
+    }
+
+    public CommandWraper(Command cmd, String table, String sql, String whereClause, String ...whereArgs) {
+      this.cmd = cmd;
+      this.table = table;
+      this.sql = sql;
+      this.whereClause = whereClause;
+      this.whereArgs = whereArgs;
+    }
+
+    @Override
+    public String toString() {
+      return "NextWraper{" +
+              "table='" + table + '\'' +
+              ", sql='" + sql + '\'' +
+              ", cmd=" + cmd +
+              ", whereClause='" + whereClause + '\'' +
+              ", whereArgs=" + Arrays.toString(whereArgs) +
+              '}';
+    }
+
+    public static CommandWraper unknown(String table){
+      final CommandWraper next = new CommandWraper(Command.UNKNOWN, table, null);
+      return next;
+    }
+
+    public static CommandWraper insert(String table){
+      final CommandWraper next = new CommandWraper(Command.INSERT, table, null);
+      return next;
+    }
+
+    public static CommandWraper delete(String table, String whereClause, String ...whereArgs){
+      final CommandWraper next = new CommandWraper(Command.DELETE, table, whereClause, whereArgs);
+      return next;
+    }
+
+    public static CommandWraper update(String table, String whereClause, String ...whereArgs){
+      final CommandWraper next = new CommandWraper(Command.UPDATE, table, whereClause, whereArgs);
+      return next;
+    }
+  }
+
+  public enum Command {
+    INSERT, DELETE, UPDATE, QUERY, UNKNOWN
+  }
+
+  public class TableMapper extends HashMap<String, String>{
+
+    final HashMap<String, Integer> counts = new HashMap<>();
+
+    @Override
+    public String remove(Object key) {
+      synchronized (this){
+        if(counts.containsKey(key)){
+          counts.put((String)key, counts.get(key) - 1);
+          int count = counts.get(key);
+          if(count == 0){
+            counts.remove(key);
+            return super.remove(key);
+          }
+        }
+        return null;
+      }
+    }
+
+    @Override
+    public String put(String key, String value) {
+      synchronized (this){
+        if(counts.containsKey(key)){
+          counts.put(key, counts.get(key) + 1);
+        }else{
+          counts.put(key, 1);
+        }
+        return super.put(key, value);
+      }
+    }
+
+    @Override
+    public void putAll(Map<? extends String, ? extends String> map) {
+      throw new RuntimeException("Not support");
     }
   }
 }

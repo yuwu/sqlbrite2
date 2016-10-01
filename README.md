@@ -106,6 +106,125 @@ try {
 System.out.println("Queries: " + queries.get()); // Prints 2
 ```
 *Note: You can also use try-with-resources with a `Transaction` instance.*
+SQLBrite2
+========
+
+`sqlbrite2`基于[sqlbrite](https://github.com/square/sqlbrite)，取名`sqlbrite2`是为了跟sqlbrite作区分。
+
+源码[github](https://github.com/yuwu/sqlbrite2)
+
+在sqlbrite基础上增加了如下功能
+-----
+
+增强表变化监听
+增加数据监听
+删除数据监听
+
+
+
+SQLBrite2如何使用
+-----
+`SQLBrite`使用教程请参考 [SQLBrite简介](https://github.com/square/sqlbrite) ，这里只给出SQLBrite2新增功能如何使用
+
+前期准备工作，创建一个SqlBrite实例
+
+```java
+SqlBrite sqlBrite = SqlBrite.create();
+BriteDatabase db = sqlBrite.wrapDatabaseHelper(openHelper, Schedulers.io());
+```
+
+表监听使用方法
+
+```java
+// 监听users表
+Observable<Query> users = db.listener("users");
+users.subscribe(new Action1<Query>() {
+  @Override public void call(Query query) {
+    Cursor cursor = query.run();
+    // TODO parse data...
+  }
+});
+```
+
+```java
+//监听users表字段id值为2的数据. id必须为主键
+...
+Observable<Query> users = db.listener("users", "id", 2);
+...
+```
+
+```java
+//1.如果users表有主键且为integer类型，这里监听的是users表主键值为2的数据
+//2.如果users没有主键，这里监听的是users表中第2行的数据。
+...
+Observable<Query> users = db.listener("users", 2);
+...
+```
+
+如果只想监听某一中操作（比如users表数据更新操作）可以使用如下事例
+```java
+...
+// 这里监听users表中的所有更新操作
+Observable<Query> users = db.listener("users", BriteDatabase.Command.UPDATE);
+users.subscribe(new Action1<Query>() {
+  @Override public void call(Query query) {
+    // cursor表示users表中已经更新后的所有数据
+    Cursor cursor = query.run();
+    // TODO parse data...
+  }
+});
+...
+```
+
+```java
+// 这里监听users表字段id值为2的更新操作. id必须为主键
+Observable<Query> users = db.listener("users", BriteDatabase.Command.UPDATE, "id", 2);
+...
+```
+```java
+// 同上面的效果一样。不同的地方是如果users表有主键且为integer类型，监听的是users表主键值为2的数据。如果没有主键监听的是users表的第二行数据
+Observable<Query> users = db.listener("users", BriteDatabase.Command.UPDATE, 2);
+...
+```
+
+```java
+// 监听users表删除操作，
+Observable<Query> users = db.listener("users", BriteDatabase.Command.DELETE);
+users.subscribe(new Action1<Query>() {
+  @Override public void call(Query query) {
+    // cursor表示users表中已经删除后的数据
+    Cursor cursor = query.run();
+    // TODO parse data...
+  }
+});
+...
+```
+```java
+// 监听users表字段id值为2的删除操作
+Observable<Query> users = db.listener("users", BriteDatabase.Command.DELETE, "id", 2);
+users.subscribe(new Action1<Query>() {
+  @Override public void call(Query query) {
+    // cursor表示users表中已经删除后的数据
+    Cursor cursor = query.run();
+    // TODO parse data...
+  }
+});
+...
+```
+
+```java
+// 监听users表插入数据操作
+Observable<Query> users = db.listener("users", BriteDatabase.Command.INSERT);
+users.subscribe(new Action1<Query>() {
+  @Override public void call(Query query) {
+    // cursor表示users表中刚插入的数据
+    Cursor cursor = query.run();
+    // TODO parse data...
+  }
+});
+...
+```
+[SQLBrite2](https://github.com/yuwu/sqlbrite2) 
 
 Since queries are just regular RxJava `Observable` objects, operators can also be used to
 control the frequency of notifications to subscribers.
